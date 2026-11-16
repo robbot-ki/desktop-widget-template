@@ -1,0 +1,8 @@
+{
+  "notesFolder": "",
+  "pythonPath": "python",
+  "whisperModel": "large-v3-turbo",
+  "whisperThreads": 0,
+  "language": "en",
+  "sleepAfterSeconds": 180
+}

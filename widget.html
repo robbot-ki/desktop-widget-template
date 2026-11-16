@@ -1,0 +1,342 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self' file:; style-src 'self' file: 'unsafe-inline'; script-src 'self' file: 'unsafe-inline'; media-src 'self' blob: mediastream:">
+<title>Desktop Widget</title>
+<style>
+  :root { --ink: #26344a; --accent: #1fa38a; --paper: #ffffff; }
+  html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none;
+               font-family: "Segoe UI", system-ui, -apple-system, Roboto, Arial, sans-serif; }
+  #stage { position: absolute; inset: 0; }
+  #figure { position: absolute; left: 50px; bottom: 4px; width: 160px; height: 182px; cursor: pointer; overflow: visible; }
+  #figure svg { width: 100%; height: 100%; overflow: visible; display: block; }
+  #overlay { position: absolute; left: 0; top: 0; width: 260px; height: 330px; pointer-events: none; overflow: visible; }
+  #bubble { position: absolute; left: 10px; right: 10px; top: 8px; padding: 9px 12px; background: var(--paper); color: var(--ink);
+            border: 3px solid var(--ink); border-radius: 16px; font-weight: 600; font-size: 13px; line-height: 1.3;
+            box-shadow: 0 4px 0 var(--ink); opacity: 0; transform: translateY(6px) scale(.96); transition: opacity .25s, transform .25s;
+            pointer-events: none; text-align: center; }
+  #bubble.on { opacity: 1; transform: none; }
+  #bubble b { font-weight: 800; color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="bubble"></div>
+  <svg id="overlay" viewBox="0 0 260 330"></svg>
+  <div id="figure"></div>
+</div>
+<script src="strings.js"></script>
+<script src="character.js"></script>
+<script>
+// ---------------- State ----------------
+// Dictation: idle -> ask (question mark) -> listen (mic, waves) -> think (dots) -> done (bulb, check) | empty | error -> idle
+// Life: moods while idle (wink, surprise, ...), eyes follow the mouse, happy hop on hover,
+// yawns and falls asleep after sleepAfterSeconds without interaction, startled when woken,
+// tilts while dragged and gets dizzy (spiral eyes, stars) when shaken fast.
+const figureEl = document.getElementById("figure");
+const overlay = document.getElementById("overlay");
+const bubble = document.getElementById("bubble");
+let T = window.STRINGS.en;
+let state = "idle", since = performance.now();
+let level = 0, levelSmooth = 0;
+let nextBlink = performance.now() + 2500, blinkUntil = 0;
+let SLEEP_S = 180;                        // seconds without click, drag or hover until it yawns
+let lastActivity = performance.now();
+let mood = null, nextMood = performance.now() + 15000;
+const MOODS = [                           // rare small expressions while idle: [expression, duration in s, weight]
+  ["wink", 0.9, 4], ["surprised", 1.3, 3], ["happy", 1.6, 3], ["focused", 1.4, 1], ["idea", 1.1, 1], ["shy", 1.4, 1]];
+let mouse = { dx: 0, dy: 0, near: false };  // cursor relative to the head (from main.js)
+let dizzy = 0, dragTilt = 0, dragSpeed = 0;
+let down = null;                          // current mouse press, null when not pressed
+const activity = () => { lastActivity = performance.now(); };
+
+function setState(s) { state = s; since = performance.now(); }
+function say(html, ms) {
+  bubble.innerHTML = html; bubble.classList.add("on");
+  clearTimeout(say.t); if (ms) say.t = setTimeout(() => bubble.classList.remove("on"), ms);
+}
+const hush = () => bubble.classList.remove("on");
+const smooth = t => t < 0 ? 0 : t > 1 ? 1 : t * t * (3 - 2 * t);
+const esc = s => String(s).replace(/[<>&]/g, "");
+
+// Head position in overlay coordinates: figure is 160 x 182 px at x 50, 4 px from the bottom; viewBox -20..420 x 0..500
+const S = 160 / 440, OX = 50 + 20 * S, OY = 330 - 4 - 182;
+const fx = x => OX + x * S, fy = y => OY + y * S;
+
+// ---------------- Drawing ----------------
+function frame(t) {
+  const d = (t - since) / 1000;
+  const o = { phase: t / 1000 };
+  const bob = Math.sin(t / 900) * 3;       // gentle floating while idle
+  // blink every few seconds
+  if (t > nextBlink) { blinkUntil = t + 140; nextBlink = t + 2500 + Math.random() * 3500; }
+  if (t < blinkUntil) o.eyesClosed = 1;
+  let extra = "";
+  // dizziness fades, drag tilt swings back
+  dizzy = Math.max(0, dizzy - 0.033 * 0.5);
+  if (!down || !down.dragging) dragTilt *= 0.85;
+
+  // fall asleep after a long rest
+  if (state === "idle" && t - lastActivity > SLEEP_S * 1000) setState("yawn");
+
+  if (state === "idle" && down && down.dragging) {
+    // being dragged: swings against the movement, with a lot of dizziness the eyes spin
+    o.expression = dizzy > 0.6 ? "dizzy" : dragSpeed > 900 ? "startled" : "surprised";
+    o.tilt = dragTilt; o.headTilt = dragTilt * 0.5; o.hop = 3;
+    if (dizzy > 0.6) extra += stars(t, dizzy);
+  } else if (state === "idle") {
+    o.expression = "neutral"; o.hop = 3 + bob;
+    // look at the mouse when it is near, otherwise wander slowly
+    o.look = mouse.near ? [mouse.dx, mouse.dy] : [Math.sin(t / 3100) * 0.35, Math.sin(t / 4300) * 0.15];
+    if (!mood && t > nextMood) {
+      const sum = MOODS.reduce((s, m) => s + m[2], 0); let r = Math.random() * sum;
+      const m = MOODS.find(x => (r -= x[2]) < 0) || MOODS[0];
+      mood = { expression: m[0], until: t + m[1] * 1000 };
+    }
+    if (mood) {
+      o.expression = mood.expression; delete o.eyesClosed;
+      if (mood.expression === "surprised") { o.hop = 3 + bob + 4; o.headTilt = 4; }
+      if (t > mood.until) { mood = null; nextMood = t + 20000 + Math.random() * 40000; }
+    }
+  } else if (state === "hover") {
+    // mouse passes over: small hop and a smile
+    o.expression = "happy"; o.look = [mouse.dx, mouse.dy];
+    o.hop = 3 + 9 * Math.max(0, Math.sin(Math.min(1, d / 0.35) * Math.PI));
+    if (d > 0.9) setState("idle");
+  } else if (state === "yawn") {
+    // yawn: head back, mouth wide, eyes close
+    const k = Math.sin(Math.min(1, d / 1.8) * Math.PI);
+    o.expression = "surprised"; o.eyesClosed = Math.min(1, d / 1.4); o.headTilt = 10 * k; o.hop = 3;
+    if (d > 2.0) setState("sleep");
+  } else if (state === "sleep") {
+    // sleeping: eyes closed, head hangs, slow breathing, zzz float up
+    o.expression = "neutral"; o.eyesClosed = 1; o.headTilt = 9 + Math.sin(t / 1400) * 1.5;
+    o.hop = 1 + Math.sin(t / 1400) * 1.2; o.squash = 0.04 + 0.03 * Math.sin(t / 1400);
+    extra += zzz(t);
+  } else if (state === "wake") {
+    // woken up: startled, hops, exclamation mark, then back to idle
+    const k = Math.min(1, d / 0.25);
+    o.expression = d < 0.8 ? "startled" : "shy";
+    o.hop = 3 + 16 * Math.max(0, Math.sin(Math.min(1, d / 0.45) * Math.PI));
+    extra += bang(k * (d < 1.0 ? 1 : Math.max(0, 1 - (d - 1.0) / 0.3)));
+    if (d > 1.7) setState("idle");
+  } else if (state === "dizzy") {
+    // after fast shaking: spiral eyes, stars circle, sways and shakes it off at the end
+    const rest = Math.max(0, 1 - d / 2.6);
+    o.expression = d < 2.2 ? "dizzy" : "shy";
+    o.tilt = Math.sin(t / 160) * 9 * rest; o.headTilt = Math.sin(t / 120 + 1) * 7 * rest; o.hop = 3;
+    if (d < 2.4) extra += stars(t, rest);
+    if (d > 2.9) { dizzy = 0; setState("idle"); }
+  } else if (state === "ask") {
+    // question mark pops up, surprised look upward
+    const k = smooth(d / 0.35);
+    o.expression = "surprised"; o.look = [0.2, -0.8 * k]; o.headTilt = 6 * k;
+    o.hop = 3 + 10 * Math.sin(Math.min(1, d / 0.35) * Math.PI);
+    extra += question(k, 1);
+    if (d > 0.7) setState("listen");
+  } else if (state === "listen") {
+    // microphone in hand, glow follows the voice, waves at the head
+    const k = smooth(d / 0.3);
+    o.expression = "focused"; o.holdingMic = true;
+    o.glow = 0.35 + 0.65 * levelSmooth; o.headTilt = -5 * k; o.look = [-0.15, 0.1]; o.hop = 3 + bob * 0.5;
+    extra += question(1 - k, 0.55 + 0.45 * (1 - k)) + waves(t, levelSmooth) + recordDot(t);
+  } else if (state === "think") {
+    o.expression = "focused"; o.headTilt = -6; o.look = [0.5, -0.7]; o.hop = 3 + bob;
+    o.glow = 0.4 + 0.3 * Math.sin(t / 180);
+    extra += dots(t);
+  } else if (state === "done") {
+    const k = smooth(d / 0.3);
+    o.expression = d < 0.7 ? "idea" : "happy"; o.hop = 3 + 12 * Math.max(0, Math.sin(Math.min(1, d / 0.4) * Math.PI));
+    extra += check(k);
+    if (d > 3.5) { hush(); setState("idle"); }
+  } else if (state === "empty" || state === "error") {
+    o.expression = "sad"; o.headTilt = 6; o.hop = 3;
+    if (d > 3.2) { hush(); setState("idle"); }
+  }
+  figureEl.innerHTML = Character(o);
+  overlay.innerHTML = extra;
+}
+
+function question(k, size) {
+  if (k <= 0.01) return "";
+  const x = fx(300), y = fy(-20) - 18 * k, s = size * (0.6 + 0.4 * k);
+  return `<g transform="translate(${x} ${y}) scale(${s}) rotate(${12 - 12 * k})" opacity="${k}">
+    <circle r="22" fill="#fff" stroke="#26344a" stroke-width="4"/>
+    <text y="11" text-anchor="middle" font-family="system-ui, sans-serif" font-weight="800" font-size="32" fill="#1fa38a">?</text></g>`;
+}
+function waves(t, p) {
+  // three arcs at the right side of the head, they grow with the voice level
+  let s = "";
+  for (let i = 0; i < 3; i++) {
+    const r = 14 + i * 11 + p * 6, a = Math.max(0.15, Math.min(1, p * 2.2 - i * 0.25 + 0.25 * Math.sin(t / 140 + i)));
+    s += `<path d="M${fx(392)} ${fy(150) - r} A ${r} ${r} 0 0 1 ${fx(392)} ${fy(150) + r}" transform="translate(${i * 2} 0)"
+           fill="none" stroke="#1fa38a" stroke-width="4" stroke-linecap="round" opacity="${a.toFixed(2)}"/>`;
+  }
+  return s;
+}
+function recordDot(t) {
+  const a = 0.55 + 0.45 * Math.sin(t / 260);
+  return `<g transform="translate(${fx(10)} ${fy(-50)})"><circle r="7" fill="#ff3b4a" opacity="${a.toFixed(2)}"/>
+    <text x="13" y="5" font-family="system-ui, sans-serif" font-weight="800" font-size="12" fill="#26344a">${esc(T.listening)}</text></g>`;
+}
+function dots(t) {
+  let s = "";
+  for (let i = 0; i < 3; i++) {
+    const lift = Math.max(0, Math.sin(t / 170 - i * 0.9)) * 7;
+    s += `<circle cx="${fx(290) + i * 16}" cy="${fy(-10) - lift}" r="5.5" fill="#1fa38a"/>`;
+  }
+  return `<g><rect x="${fx(290) - 14}" y="${fy(-10) - 20}" width="60" height="30" rx="15" fill="#fff" stroke="#26344a" stroke-width="3"/>${s}</g>`;
+}
+function zzz(t) {
+  // three z rise diagonally up and right, grow and fade
+  let s = "";
+  for (let i = 0; i < 3; i++) {
+    const p = ((t / 2400) + i / 3) % 1;
+    s += `<text x="${fx(330) + p * 34}" y="${fy(20) - p * 70}" font-family="system-ui, sans-serif" font-weight="800" font-size="${12 + p * 14}"
+           fill="#1fa38a" opacity="${(Math.sin(p * Math.PI)).toFixed(2)}">z</text>`;
+  }
+  return s;
+}
+function stars(t, strength) {
+  // small stars circle the head (dizziness)
+  let s = "";
+  const cx = fx(200), cy = fy(40), rx = 70 * S * 1.9, ry = 16;
+  for (let i = 0; i < 3; i++) {
+    const a = t / 230 + i * 2.094, x = cx + Math.cos(a) * rx, y = cy + Math.sin(a) * ry, g = 0.8 + 0.3 * Math.sin(a);
+    s += `<path transform="translate(${x.toFixed(1)} ${y.toFixed(1)}) scale(${g.toFixed(2)})" d="M0 -8 L2.4 -2.4 L8 0 L2.4 2.4 L0 8 L-2.4 2.4 L-8 0 L-2.4 -2.4 Z"
+           fill="#ffd84a" stroke="#26344a" stroke-width="1.6" opacity="${Math.min(1, strength * 1.5).toFixed(2)}"/>`;
+  }
+  return s;
+}
+function bang(k) {
+  if (k <= 0.01) return "";
+  return `<g transform="translate(${fx(300)} ${fy(-20)}) scale(${0.6 + 0.4 * k})" opacity="${k.toFixed(2)}">
+    <circle r="22" fill="#fff" stroke="#26344a" stroke-width="4"/>
+    <text y="11" text-anchor="middle" font-family="system-ui, sans-serif" font-weight="800" font-size="32" fill="#ff3b4a">!</text></g>`;
+}
+function check(k) {
+  return `<g transform="translate(${fx(300)} ${fy(-20)}) scale(${0.6 + 0.4 * k})" opacity="${k}">
+    <circle r="22" fill="#1fa38a" stroke="#26344a" stroke-width="4"/>
+    <path d="M-10 0 L-3 8 L11 -8" fill="none" stroke="#fff" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/></g>`;
+}
+
+// 30 frames per second are plenty for the character and go easy on the CPU
+let lastFrame = 0;
+function loop(t) {
+  if (t - lastFrame > 33) { lastFrame = t; frame(t); }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ---------------- Recording ----------------
+let stream = null, recorder = null, chunks = [], analyser = null, audioCtx = null, levelTimer = null;
+let speechStart = 0, lastVoice = 0, recordStart = 0;
+const VOICE_THRESHOLD = 0.06;   // level (RMS) from which we assume a voice; adjust if your microphone is quiet or loud
+const SILENCE_END_MS = 2200;    // this much silence after speaking ends the recording
+const NOTHING_MS = 9000;        // saying nothing for this long gives "heard nothing"
+const MAX_MS = 120000;          // safety stop: two minutes
+
+async function startRecording() {
+  window.widget.warmUp();       // Whisper loads while you speak
+  setState("ask");
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) {
+    setState("error"); say(T.noMic, 3200); return;
+  }
+  audioCtx = new AudioContext();
+  const source = audioCtx.createMediaStreamSource(stream);
+  analyser = audioCtx.createAnalyser(); analyser.fftSize = 1024; source.connect(analyser);
+  const samples = new Float32Array(analyser.fftSize);
+  chunks = [];
+  recorder = new MediaRecorder(stream, { mimeType: "audio/webm;codecs=opus" });
+  recorder.ondataavailable = e => e.data.size && chunks.push(e.data);
+  recorder.onstop = recordingFinished;
+  recorder.start(250);
+  recordStart = performance.now(); speechStart = 0; lastVoice = 0;
+  levelTimer = setInterval(() => {
+    analyser.getFloatTimeDomainData(samples);
+    let q = 0; for (const v of samples) q += v * v;
+    level = Math.sqrt(q / samples.length);
+    levelSmooth += (Math.min(1, level * 6) - levelSmooth) * 0.35;
+    const now = performance.now();
+    if (level > VOICE_THRESHOLD) { if (!speechStart) speechStart = now; lastVoice = now; }
+    const elapsed = now - recordStart;
+    if ((speechStart && now - lastVoice > SILENCE_END_MS) || (!speechStart && elapsed > NOTHING_MS) || elapsed > MAX_MS) stopRecording();
+  }, 50);
+}
+
+function stopRecording() {
+  if (!recorder || recorder.state === "inactive") return;
+  clearInterval(levelTimer); levelSmooth = 0;
+  recorder.stop();
+  stream.getTracks().forEach(s => s.stop());
+  audioCtx.close();
+}
+
+async function recordingFinished() {
+  const nothing = !speechStart;
+  recorder = null;
+  if (nothing) { setState("empty"); say(T.heardNothing, 3000); return; }
+  setState("think"); say(T.writing); clearTimeout(say.long); say.long = setTimeout(() => state === "think" && say(T.writingLong), 9000);
+  const buffer = await new Blob(chunks, { type: "audio/webm" }).arrayBuffer();
+  const r = await window.widget.recording(buffer);
+  clearTimeout(say.long);
+  if (r.ok) { setState("done"); say(`${esc(T.saved)}<br><b>${esc(r.title)}</b>`, 3400); }
+  else if (r.empty) { setState("empty"); say(T.notUnderstood, 3000); }
+  else { setState("error"); say(esc(T.oops) + esc(r.error).slice(0, 90), 4000); }
+}
+
+// ---------------- Mouse: click, drag, right-click ----------------
+const calm = () => ["idle", "hover", "done", "empty", "error"].includes(state);
+figureEl.addEventListener("mousedown", e => {
+  if (e.button !== 0) return;
+  activity();
+  down = { x: e.screenX, y: e.screenY, dragging: false, lx: e.screenX, ly: e.screenY, lt: performance.now() };
+  window.widget.dragStart({ x: e.screenX, y: e.screenY });
+});
+window.addEventListener("mousemove", e => {
+  if (!down) return;
+  if (!down.dragging && Math.hypot(e.screenX - down.x, e.screenY - down.y) > 4) {
+    down.dragging = true;
+    if (calm()) { mood = null; setState("idle"); }
+  }
+  if (!down.dragging) return;
+  window.widget.drag({ x: e.screenX, y: e.screenY });
+  // measure speed: fast back and forth charges up the dizziness (pixels per second)
+  const now = performance.now(), dt = Math.max(8, now - down.lt) / 1000;
+  const vx = (e.screenX - down.lx) / dt, v = Math.hypot(vx, (e.screenY - down.ly) / dt);
+  dragSpeed += (v - dragSpeed) * 0.3;
+  dragTilt += (Math.max(-28, Math.min(28, -vx * 0.012)) - dragTilt) * 0.35;
+  if (dragSpeed > 1400) dizzy = Math.min(1.5, dizzy + (dragSpeed - 1400) / 1400 * dt * 1.4);
+  down.lx = e.screenX; down.ly = e.screenY; down.lt = now; activity();
+});
+window.addEventListener("mouseup", e => {
+  if (!down || e.button !== 0) return;
+  const wasClick = !down.dragging; down = null; dragSpeed = 0;
+  window.widget.dragEnd();
+  if (!wasClick) { if (dizzy > 0.6 && state === "idle") setState("dizzy"); return; }
+  if (state === "sleep" || state === "yawn") { setState("wake"); return; }   // wake it first, do not record right away
+  if (state === "listen" || state === "ask") stopRecording();
+  else if (calm()) { hush(); mood = null; startRecording(); }
+});
+figureEl.addEventListener("mouseenter", () => {
+  activity();
+  if (state === "idle" && !down) { mood = null; setState("hover"); }
+});
+figureEl.addEventListener("contextmenu", e => { e.preventDefault(); activity(); window.widget.menu(); });
+
+// Cursor position from main.js: the eyes follow it when it is closer than 700 px
+window.widget.onMouse(m => { mouse = m; });
+window.widget.settings().then(s => {
+  if (s.sleepAfterSeconds) SLEEP_S = s.sleepAfterSeconds;
+  if (window.STRINGS[s.language]) T = window.STRINGS[s.language];
+  document.documentElement.lang = s.language;
+  figureEl.title = T.tooltip;
+});
+// Test hooks: main.js sets states directly in test mode so every animation gets a frame
+window.__test = { state: () => state, set: setState, mood: a => { mood = { expression: a, until: performance.now() + 1500 }; }, dizzy: v => { dizzy = v; } };
+</script>
+</body>
+</html>

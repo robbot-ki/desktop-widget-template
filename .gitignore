@@ -1,0 +1,8 @@
+node_modules/
+recordings/
+position.json
+config.json
+*.webm
+*.wav
+test-frames/
+.DS_Store

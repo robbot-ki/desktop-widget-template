@@ -1,0 +1,14 @@
+{
+  "name": "desktop-widget-template",
+  "version": "0.1.0",
+  "description": "A talking desktop widget: click it, speak, and local Whisper saves your idea as a Markdown note.",
+  "main": "main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}
